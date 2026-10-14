@@ -1,10 +1,12 @@
 //! Bounded proof for the pure RESP2 line-framing decision seam.
 //!
-//! `classify_first_cr` is called by the production `memchr` path and decides
-//! whether the first carriage return completes a line. The proof covers every
-//! eight-byte input and every optional candidate index. It does not prove the
-//! full parser or `memchr` itself; runtime tests bridge the classifier contract
-//! to both public parser entry points.
+//! `classify_first_cr` is called by the `memchr` scanner that `parse` and
+//! `parse_bytes` use, and decides whether the first carriage return completes
+//! a line. `parse_segments` scans with its own search across pieces, which
+//! this proof does not cover. The proof covers every eight-byte input and
+//! every optional candidate index. It does not prove the full parser or
+//! `memchr` itself; runtime tests bridge the classifier contract to `parse`
+//! and `parse_bytes`.
 
 use crate::value::classify_first_cr;
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Value::parse_segments` and `Value::parse_segments_with_options` parse a
+  value from bytes that arrived in several pieces (`&[Bytes]`), as a receive
+  path that does not copy them into one buffer delivers them. The result is
+  what `parse_bytes` gives on the pieces joined: the same value, consumed
+  count and error. A string within one piece is a slice of it; a string that
+  spans pieces is copied.
+
+### Changed
+
+- `parse_bytes` and `parse_segments` share one parser over positions in the
+  input. Parsing an array or map no longer takes a `Bytes` slice of the rest
+  of the input for each element. `parse_bytes` against the preceding commit
+  (b52cc66) on arm64, medians of interleaved runs each the best of seven: a
+  map of 20 entries about 30% faster, an array of 100 bulk strings about
+  8-10% faster, a simple string about 6% faster, bulk strings of 64 B and
+  16 KiB within 3%, and an integer about 1 ns (9%) slower.
+
 ## [0.0.2] - 2026-08-19
 
 ### Added
