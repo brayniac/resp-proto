@@ -21,6 +21,7 @@
 //! - Attribute: `|<len>\r\n<attrs>...<value>`
 
 use crate::error::ParseError;
+use crate::input::{Input, Segments};
 use bytes::Bytes;
 use std::io::Write;
 
@@ -595,48 +596,40 @@ impl Value {
         options: &ParseOptions,
     ) -> Result<(Self, usize), ParseError> {
         let mut total_items = 0;
-        Self::parse_bytes_internal(&data, options, 0, &mut total_items)
+        parse_at(&data, 0, options, 0, &mut total_items)
     }
 
-    /// Internal zero-copy parsing function.
-    fn parse_bytes_internal(
-        data: &Bytes,
-        options: &ParseOptions,
-        depth: usize,
-        total_items: &mut usize,
-    ) -> Result<(Self, usize), ParseError> {
-        if data.is_empty() {
-            return Err(ParseError::Incomplete);
-        }
+    /// Parse a RESP value from bytes that arrived in several pieces.
+    ///
+    /// `segments` are consecutive pieces of one byte stream, in order, as a
+    /// receive path that does not copy them into one buffer delivers them.
+    /// The result is the same as [`parse_bytes`](Self::parse_bytes) on the
+    /// pieces joined: the same value, the same number of bytes consumed
+    /// (counted across pieces), and the same errors. String variants that lie
+    /// within one piece are `Bytes::slice()` references into it; one that
+    /// spans pieces is copied into a new `Bytes`.
+    ///
+    /// Each call builds a table of piece start offsets, linear in the number
+    /// of pieces, which is heap-allocated when there are more than eight. A
+    /// caller that retries after
+    /// [`ParseError::Incomplete`] as pieces arrive should join small pieces
+    /// first, or the retries cost the square of the piece count.
+    #[inline]
+    pub fn parse_segments(segments: &[Bytes]) -> Result<(Self, usize), ParseError> {
+        Self::parse_segments_with_options(segments, &ParseOptions::default())
+    }
 
-        match data[0] {
-            b'+' => parse_simple_string_bytes(data, options),
-            b'-' => parse_error_bytes(data, options),
-            b':' => parse_integer(&data[..], options),
-            b'$' => parse_bulk_string_bytes(data, options),
-            b'*' => parse_array_bytes(data, options, depth, total_items),
-            #[cfg(feature = "resp3")]
-            b'_' => parse_null(&data[..]),
-            #[cfg(feature = "resp3")]
-            b'#' => parse_boolean(&data[..]),
-            #[cfg(feature = "resp3")]
-            b',' => parse_double(&data[..], options),
-            #[cfg(feature = "resp3")]
-            b'(' => parse_big_number_bytes(data, options),
-            #[cfg(feature = "resp3")]
-            b'!' => parse_bulk_error_bytes(data, options),
-            #[cfg(feature = "resp3")]
-            b'=' => parse_verbatim_string_bytes(data, options),
-            #[cfg(feature = "resp3")]
-            b'%' => parse_map_bytes(data, options, depth, total_items),
-            #[cfg(feature = "resp3")]
-            b'~' => parse_set_bytes(data, options, depth, total_items),
-            #[cfg(feature = "resp3")]
-            b'>' => parse_push_bytes(data, options, depth, total_items),
-            #[cfg(feature = "resp3")]
-            b'|' => parse_attribute_bytes(data, options, depth, total_items),
-            other => Err(ParseError::InvalidPrefix(other)),
+    /// Parse a RESP value from bytes in several pieces, with custom options.
+    /// See [`parse_segments`](Self::parse_segments).
+    pub fn parse_segments_with_options(
+        segments: &[Bytes],
+        options: &ParseOptions,
+    ) -> Result<(Self, usize), ParseError> {
+        let mut total_items = 0;
+        if let [one] = segments {
+            return parse_at(one, 0, options, 0, &mut total_items);
         }
+        parse_at(&Segments::new(segments), 0, options, 0, &mut total_items)
     }
 
     /// Internal parsing function that tracks nesting depth and total items.
@@ -820,7 +813,7 @@ impl Value {
 /// carry server text that can echo binary-safe key names, so a stray `\r` is
 /// reachable in practice.
 #[inline]
-fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
+pub(crate) fn find_crlf(data: &[u8], max_line_len: usize) -> Result<Option<usize>, ParseError> {
     let mut offset = 0;
     while let Some(relative) = memchr::memchr(b'\r', &data[offset..]) {
         let first_cr = offset + relative;
@@ -964,37 +957,148 @@ fn parse_array(
 }
 
 // ============================================================================
-// Zero-copy (Bytes) parsing helpers
+// Zero-copy parsing over an `Input`
 // ============================================================================
+//
+// Each function parses one value starting at `base` and returns it with the
+// number of bytes it consumed from `base`. `parse_bytes` runs them on one
+// `Bytes`; `parse_segments` on several.
 
-/// Parse a simple string zero-copy: +OK\r\n
-fn parse_simple_string_bytes(
-    data: &Bytes,
+/// Parse one value starting at `base`.
+fn parse_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
 ) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let content = data.slice(1..end);
-    Ok((Value::SimpleString(content), end + 2))
+    if base >= inp.len() {
+        return Err(ParseError::Incomplete);
+    }
+
+    match inp.byte(base) {
+        b'+' => {
+            let end = line_end(inp, base, options)?;
+            Ok((
+                Value::SimpleString(inp.slice(base + 1, base + end)),
+                end + 2,
+            ))
+        }
+        b'-' => {
+            let end = line_end(inp, base, options)?;
+            Ok((Value::Error(inp.slice(base + 1, base + end)), end + 2))
+        }
+        b':' => {
+            let end = line_end(inp, base, options)?;
+            Ok((Value::Integer(header_i64(inp, base, end)?), end + 2))
+        }
+        b'$' => parse_bulk_string_at(inp, base, options),
+        b'*' => parse_array_at(inp, base, options, depth, total_items),
+        #[cfg(feature = "resp3")]
+        b'_' => inp.with_range(base, inp.len().min(base + 3), parse_null),
+        #[cfg(feature = "resp3")]
+        b'#' => inp.with_range(base, inp.len().min(base + 4), parse_boolean),
+        #[cfg(feature = "resp3")]
+        b',' => {
+            let end = line_end(inp, base, options)?;
+            let value = inp.with_range(base + 1, base + end, double_value)?;
+            Ok((Value::Double(value), end + 2))
+        }
+        #[cfg(feature = "resp3")]
+        b'(' => {
+            let end = line_end(inp, base, options)?;
+            Ok((Value::BigNumber(inp.slice(base + 1, base + end)), end + 2))
+        }
+        #[cfg(feature = "resp3")]
+        b'!' => parse_bulk_error_at(inp, base, options),
+        #[cfg(feature = "resp3")]
+        b'=' => parse_verbatim_string_at(inp, base, options),
+        #[cfg(feature = "resp3")]
+        b'%' => parse_map_at(inp, base, options, depth, total_items),
+        #[cfg(feature = "resp3")]
+        b'~' => {
+            parse_set_at(inp, base, options, depth, total_items).map(|(v, n)| (Value::Set(v), n))
+        }
+        #[cfg(feature = "resp3")]
+        b'>' => {
+            parse_set_at(inp, base, options, depth, total_items).map(|(v, n)| (Value::Push(v), n))
+        }
+        #[cfg(feature = "resp3")]
+        b'|' => parse_attribute_at(inp, base, options, depth, total_items),
+        other => Err(ParseError::InvalidPrefix(other)),
+    }
 }
 
-/// Parse an error zero-copy: -ERR message\r\n
-fn parse_error_bytes(data: &Bytes, options: &ParseOptions) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let content = data.slice(1..end);
-    Ok((Value::Error(content), end + 2))
+/// Offset from `base` of the CR that ends the line starting at `base`.
+#[inline]
+fn line_end<I: Input>(inp: &I, base: usize, options: &ParseOptions) -> Result<usize, ParseError> {
+    let cr = inp
+        .find_crlf(base, options.max_line_len)?
+        .ok_or(ParseError::Incomplete)?;
+    Ok(cr - base)
 }
 
-/// Parse a bulk string zero-copy: $6\r\nfoobar\r\n or $-1\r\n
-fn parse_bulk_string_bytes(
-    data: &Bytes,
+/// The signed length in a header line `base + 1 .. base + len_end`.
+#[inline]
+fn header_i64<I: Input>(inp: &I, base: usize, len_end: usize) -> Result<i64, ParseError> {
+    inp.with_range(base + 1, base + len_end, |s| {
+        std::str::from_utf8(s)
+            .map_err(|e| ParseError::InvalidInteger(e.to_string()))?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))
+    })
+}
+
+/// The unsigned length in a header line `base + 1 .. base + len_end`.
+#[cfg(feature = "resp3")]
+#[inline]
+fn header_usize<I: Input>(inp: &I, base: usize, len_end: usize) -> Result<usize, ParseError> {
+    inp.with_range(base + 1, base + len_end, |s| {
+        std::str::from_utf8(s)
+            .map_err(|e| ParseError::InvalidInteger(e.to_string()))?
+            .parse()
+            .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))
+    })
+}
+
+/// Offsets from `base` of a length-prefixed body: `(data_start, data_end,
+/// total_end)`, after checking the input holds `total_end` bytes.
+#[inline]
+fn body_bounds<I: Input>(
+    inp: &I,
+    base: usize,
+    len_end: usize,
+    len: usize,
+) -> Result<(usize, usize, usize), ParseError> {
+    let data_start = len_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let total_end = data_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    if inp.len() - base < total_end {
+        return Err(ParseError::Incomplete);
+    }
+    Ok((data_start, data_end, total_end))
+}
+
+#[inline]
+fn trailing_crlf<I: Input>(inp: &I, at: usize) -> Result<(), ParseError> {
+    if inp.byte(at) != b'\r' || inp.byte(at + 1) != b'\n' {
+        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
+    }
+    Ok(())
+}
+
+/// Parse a bulk string: $6\r\nfoobar\r\n or $-1\r\n
+fn parse_bulk_string_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: i64 = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+    let len_end = line_end(inp, base, options)?;
+    let len = header_i64(inp, base, len_end)?;
 
     if len < 0 {
         return Ok((Value::Null, len_end + 2));
@@ -1005,29 +1109,17 @@ fn parse_bulk_string_bytes(
         return Err(ParseError::Protocol("bulk string too large".to_string()));
     }
 
-    let data_start = len_end + 2;
-    let data_end = data_start
-        .checked_add(len)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
-    let total_end = data_end
-        .checked_add(2)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let (data_start, data_end, total_end) = body_bounds(inp, base, len_end, len)?;
+    trailing_crlf(inp, base + data_end)?;
 
-    if data.len() < total_end {
-        return Err(ParseError::Incomplete);
-    }
-
-    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
-        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
-    }
-
-    let content = data.slice(data_start..data_end);
+    let content = inp.slice(base + data_start, base + data_end);
     Ok((Value::BulkString(content), total_end))
 }
 
-/// Parse an array zero-copy: *2\r\n...
-fn parse_array_bytes(
-    data: &Bytes,
+/// Parse an array: *2\r\n...
+fn parse_array_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
     depth: usize,
     total_items: &mut usize,
@@ -1036,12 +1128,8 @@ fn parse_array_bytes(
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: i64 = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+    let len_end = line_end(inp, base, options)?;
+    let len = header_i64(inp, base, len_end)?;
 
     if len < 0 {
         return Ok((Value::Null, len_end + 2));
@@ -1061,13 +1149,8 @@ fn parse_array_bytes(
 
     let mut pos = len_end + 2;
     let mut elements = Vec::with_capacity(len);
-
     for _ in 0..len {
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        let (value, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
         elements.push(value);
         pos += consumed;
     }
@@ -1075,66 +1158,52 @@ fn parse_array_bytes(
     Ok((Value::Array(elements), pos))
 }
 
-/// Parse RESP3 big number zero-copy: (12345678901234567890\r\n
-#[cfg(feature = "resp3")]
-fn parse_big_number_bytes(
-    data: &Bytes,
+/// Parse the collection element at offset `pos` from `base`.
+#[inline]
+fn parse_element<I: Input>(
+    inp: &I,
+    base: usize,
+    pos: usize,
     options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
 ) -> Result<(Value, usize), ParseError> {
-    let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let content = data.slice(1..end);
-    Ok((Value::BigNumber(content), end + 2))
+    if base + pos >= inp.len() {
+        return Err(ParseError::Incomplete);
+    }
+    parse_at(inp, base + pos, options, depth + 1, total_items)
 }
 
-/// Parse RESP3 bulk error zero-copy: !<len>\r\n<error>\r\n
+/// Parse RESP3 bulk error: !<len>\r\n<error>\r\n
 #[cfg(feature = "resp3")]
-fn parse_bulk_error_bytes(
-    data: &Bytes,
+fn parse_bulk_error_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+    let len_end = line_end(inp, base, options)?;
+    let len = header_usize(inp, base, len_end)?;
 
     if len > options.max_bulk_string_len {
         return Err(ParseError::Protocol("bulk error too large".to_string()));
     }
 
-    let data_start = len_end + 2;
-    let data_end = data_start
-        .checked_add(len)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
-    let total_end = data_end
-        .checked_add(2)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let (data_start, data_end, total_end) = body_bounds(inp, base, len_end, len)?;
+    trailing_crlf(inp, base + data_end)?;
 
-    if data.len() < total_end {
-        return Err(ParseError::Incomplete);
-    }
-
-    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
-        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
-    }
-
-    let content = data.slice(data_start..data_end);
+    let content = inp.slice(base + data_start, base + data_end);
     Ok((Value::BulkError(content), total_end))
 }
 
-/// Parse RESP3 verbatim string zero-copy: =<len>\r\ntxt:<data>\r\n
+/// Parse RESP3 verbatim string: =<len>\r\ntxt:<data>\r\n
 #[cfg(feature = "resp3")]
-fn parse_verbatim_string_bytes(
-    data: &Bytes,
+fn parse_verbatim_string_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
 ) -> Result<(Value, usize), ParseError> {
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+    let len_end = line_end(inp, base, options)?;
+    let len = header_usize(inp, base, len_end)?;
 
     if len > options.max_bulk_string_len {
         return Err(ParseError::Protocol(
@@ -1142,30 +1211,20 @@ fn parse_verbatim_string_bytes(
         ));
     }
 
-    let data_start = len_end + 2;
-    let data_end = data_start
-        .checked_add(len)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
-    let total_end = data_end
-        .checked_add(2)
-        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let (data_start, data_end, total_end) = body_bounds(inp, base, len_end, len)?;
 
-    if data.len() < total_end {
-        return Err(ParseError::Incomplete);
-    }
-
-    if len < 4 || data[data_start + 3] != b':' {
+    if len < 4 || inp.byte(base + data_start + 3) != b':' {
         return Err(ParseError::InvalidVerbatimFormat);
     }
 
-    if data[data_end] != b'\r' || data[data_end + 1] != b'\n' {
-        return Err(ParseError::Protocol("missing trailing CRLF".to_string()));
-    }
+    trailing_crlf(inp, base + data_end)?;
 
-    let format: [u8; 3] = data[data_start..data_start + 3]
-        .try_into()
-        .map_err(|_| ParseError::InvalidVerbatimFormat)?;
-    let content = data.slice(data_start + 4..data_end);
+    let format = [
+        inp.byte(base + data_start),
+        inp.byte(base + data_start + 1),
+        inp.byte(base + data_start + 2),
+    ];
+    let content = inp.slice(base + data_start + 4, base + data_end);
 
     Ok((
         Value::VerbatimString {
@@ -1176,31 +1235,32 @@ fn parse_verbatim_string_bytes(
     ))
 }
 
-/// Parse RESP3 map zero-copy: %<len>\r\n<key><val>...
+/// The header of a RESP3 aggregate: its element count and the offset of the
+/// first element. Charges `per_element * len + extra` items to the budget.
 #[cfg(feature = "resp3")]
-fn parse_map_bytes(
-    data: &Bytes,
+fn aggregate_header<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
     depth: usize,
     total_items: &mut usize,
-) -> Result<(Value, usize), ParseError> {
+    per_element: usize,
+    extra: usize,
+) -> Result<(usize, usize), ParseError> {
     if depth >= options.max_depth {
         return Err(ParseError::NestingTooDeep(depth));
     }
 
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
+    let len_end = line_end(inp, base, options)?;
+    let len = header_usize(inp, base, len_end)?;
 
     if len > options.max_collection_elements {
         return Err(ParseError::CollectionTooLarge(len));
     }
 
     let items_to_add = len
-        .checked_mul(2)
+        .checked_mul(per_element)
+        .and_then(|n| n.checked_add(extra))
         .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
     *total_items = total_items
         .checked_add(items_to_add)
@@ -1209,187 +1269,69 @@ fn parse_map_bytes(
         return Err(ParseError::CollectionTooLarge(*total_items));
     }
 
-    let mut pos = len_end + 2;
+    Ok((len, len_end + 2))
+}
+
+/// Parse RESP3 map: %<len>\r\n<key><val>...
+#[cfg(feature = "resp3")]
+fn parse_map_at<I: Input>(
+    inp: &I,
+    base: usize,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<(Value, usize), ParseError> {
+    let (len, mut pos) = aggregate_header(inp, base, options, depth, total_items, 2, 0)?;
     let mut entries = Vec::with_capacity(len);
-
     for _ in 0..len {
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (key, key_consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-        pos += key_consumed;
-
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (value, val_consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-        pos += val_consumed;
-
+        let (key, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
+        pos += consumed;
+        let (value, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
+        pos += consumed;
         entries.push((key, value));
     }
-
     Ok((Value::Map(entries), pos))
 }
 
-/// Parse RESP3 set zero-copy: ~<len>\r\n<elem>...
+/// Parse the elements of a RESP3 set (~) or push (>) message.
 #[cfg(feature = "resp3")]
-fn parse_set_bytes(
-    data: &Bytes,
+fn parse_set_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
     depth: usize,
     total_items: &mut usize,
-) -> Result<(Value, usize), ParseError> {
-    if depth >= options.max_depth {
-        return Err(ParseError::NestingTooDeep(depth));
-    }
-
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
-
-    if len > options.max_collection_elements {
-        return Err(ParseError::CollectionTooLarge(len));
-    }
-
-    *total_items = total_items
-        .checked_add(len)
-        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
-    if *total_items > options.max_total_items {
-        return Err(ParseError::CollectionTooLarge(*total_items));
-    }
-
-    let mut pos = len_end + 2;
+) -> Result<(Vec<Value>, usize), ParseError> {
+    let (len, mut pos) = aggregate_header(inp, base, options, depth, total_items, 1, 0)?;
     let mut elements = Vec::with_capacity(len);
-
     for _ in 0..len {
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
+        let (value, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
         elements.push(value);
         pos += consumed;
     }
-
-    Ok((Value::Set(elements), pos))
+    Ok((elements, pos))
 }
 
-/// Parse RESP3 push message zero-copy: ><len>\r\n<elem>...
+/// Parse RESP3 attribute: |<len>\r\n<attrs>...<value>
 #[cfg(feature = "resp3")]
-fn parse_push_bytes(
-    data: &Bytes,
+fn parse_attribute_at<I: Input>(
+    inp: &I,
+    base: usize,
     options: &ParseOptions,
     depth: usize,
     total_items: &mut usize,
 ) -> Result<(Value, usize), ParseError> {
-    if depth >= options.max_depth {
-        return Err(ParseError::NestingTooDeep(depth));
-    }
-
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
-
-    if len > options.max_collection_elements {
-        return Err(ParseError::CollectionTooLarge(len));
-    }
-
-    *total_items = total_items
-        .checked_add(len)
-        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
-    if *total_items > options.max_total_items {
-        return Err(ParseError::CollectionTooLarge(*total_items));
-    }
-
-    let mut pos = len_end + 2;
-    let mut elements = Vec::with_capacity(len);
-
-    for _ in 0..len {
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (value, consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-        elements.push(value);
-        pos += consumed;
-    }
-
-    Ok((Value::Push(elements), pos))
-}
-
-/// Parse RESP3 attribute zero-copy: |<len>\r\n<attrs>...<value>
-#[cfg(feature = "resp3")]
-fn parse_attribute_bytes(
-    data: &Bytes,
-    options: &ParseOptions,
-    depth: usize,
-    total_items: &mut usize,
-) -> Result<(Value, usize), ParseError> {
-    if depth >= options.max_depth {
-        return Err(ParseError::NestingTooDeep(depth));
-    }
-
-    let len_end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let len_str = std::str::from_utf8(&data[1..len_end])
-        .map_err(|e| ParseError::InvalidInteger(e.to_string()))?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e: std::num::ParseIntError| ParseError::InvalidInteger(e.to_string()))?;
-
-    if len > options.max_collection_elements {
-        return Err(ParseError::CollectionTooLarge(len));
-    }
-
-    let items_to_add = len
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
-    *total_items = total_items
-        .checked_add(items_to_add)
-        .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
-    if *total_items > options.max_total_items {
-        return Err(ParseError::CollectionTooLarge(*total_items));
-    }
-
-    let mut pos = len_end + 2;
+    let (len, mut pos) = aggregate_header(inp, base, options, depth, total_items, 2, 1)?;
     let mut attrs = Vec::with_capacity(len);
-
     for _ in 0..len {
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (key, key_consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-        pos += key_consumed;
-
-        if pos >= data.len() {
-            return Err(ParseError::Incomplete);
-        }
-        let sub = data.slice(pos..);
-        let (val, val_consumed) =
-            Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-        pos += val_consumed;
-
+        let (key, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
+        pos += consumed;
+        let (val, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
+        pos += consumed;
         attrs.push((key, val));
     }
-
-    if pos >= data.len() {
-        return Err(ParseError::Incomplete);
-    }
-    let sub = data.slice(pos..);
-    let (value, val_consumed) = Value::parse_bytes_internal(&sub, options, depth + 1, total_items)?;
-    pos += val_consumed;
+    let (value, consumed) = parse_element(inp, base, pos, options, depth, total_items)?;
+    pos += consumed;
 
     Ok((
         Value::Attribute {
@@ -1501,19 +1443,21 @@ fn parse_boolean(data: &[u8]) -> Result<(Value, usize), ParseError> {
 #[cfg(feature = "resp3")]
 fn parse_double(data: &[u8], options: &ParseOptions) -> Result<(Value, usize), ParseError> {
     let end = find_crlf(data, options.max_line_len)?.ok_or(ParseError::Incomplete)?;
-    let s =
-        std::str::from_utf8(&data[1..end]).map_err(|e| ParseError::InvalidDouble(e.to_string()))?;
+    Ok((Value::Double(double_value(&data[1..end])?), end + 2))
+}
 
-    // Handle special values
-    let value = match s {
+/// The value of a RESP3 double's text, including `inf`, `-inf` and `nan`.
+#[cfg(feature = "resp3")]
+fn double_value(text: &[u8]) -> Result<f64, ParseError> {
+    let s = std::str::from_utf8(text).map_err(|e| ParseError::InvalidDouble(e.to_string()))?;
+    Ok(match s {
         "inf" => f64::INFINITY,
         "-inf" => f64::NEG_INFINITY,
         "nan" => f64::NAN,
         _ => s
             .parse()
             .map_err(|e: std::num::ParseFloatError| ParseError::InvalidDouble(e.to_string()))?,
-    };
-    Ok((Value::Double(value), end + 2))
+    })
 }
 
 /// Parse RESP3 big number: (12345678901234567890\r\n

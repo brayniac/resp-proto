@@ -52,6 +52,7 @@
 pub mod cluster;
 mod command;
 mod error;
+mod input;
 #[cfg(kani)]
 mod kani_resp2;
 mod request;
