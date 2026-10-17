@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what `parse_bytes` gives on the pieces joined: the same value, consumed
   count and error. A string within one piece is a slice of it; a string that
   spans pieces is copied.
+- `Value::scan_segments` and `Value::scan_segments_with_options` find the
+  end of the value at the start of several pieces without building it:
+  `Frame::Complete(len)` with the length `parse_segments` would consume,
+  `Frame::Incomplete(n)` with a lower bound on the bytes still needed, or the
+  error the parse would return. A caller can scan on each arrival and parse
+  once, so an incomplete value's strings that span pieces are not copied and
+  discarded on every arrival.
 
 ### Changed
 

@@ -69,5 +69,5 @@ pub use request::{Request, SetRequest};
 pub use streaming::{ParseProgress, STREAMING_THRESHOLD, SetHeader, complete_set, parse_streaming};
 pub use value::{
     DEFAULT_MAX_BULK_STRING_LEN, DEFAULT_MAX_COLLECTION_ELEMENTS, DEFAULT_MAX_DEPTH,
-    DEFAULT_MAX_KEY_LEN, DEFAULT_MAX_LINE_LEN, DEFAULT_MAX_TOTAL_ITEMS, ParseOptions, Value,
+    DEFAULT_MAX_KEY_LEN, DEFAULT_MAX_LINE_LEN, DEFAULT_MAX_TOTAL_ITEMS, Frame, ParseOptions, Value,
 };

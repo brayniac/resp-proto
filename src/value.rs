@@ -231,6 +231,16 @@ pub enum Value {
     },
 }
 
+/// The result of [`Value::scan_segments`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frame {
+    /// The input starts with a complete value of this many bytes.
+    Complete(usize),
+    /// The input is the start of a value that needs at least this many more
+    /// bytes.
+    Incomplete(usize),
+}
+
 impl Value {
     // ========================================================================
     // Constructors
@@ -630,6 +640,42 @@ impl Value {
             return parse_at(one, 0, options, 0, &mut total_items);
         }
         parse_at(&Segments::new(segments), 0, options, 0, &mut total_items)
+    }
+
+    /// Find the end of the value at the start of `segments` without building
+    /// it.
+    ///
+    /// Returns [`Frame::Complete`] with the byte count
+    /// [`parse_segments`](Self::parse_segments) would consume, or
+    /// [`Frame::Incomplete`] with a lower bound on the bytes still needed,
+    /// and the same errors that parse would return. It does not copy a
+    /// string's contents. It allocates the piece offset table above eight
+    /// pieces, a copy of each length header, integer, double, null or boolean
+    /// that spans pieces, and the message of an error it returns. A caller
+    /// that receives bytes in pieces can call it on each arrival and parse
+    /// once the value is complete: a parse of an incomplete value copies each
+    /// string that spans pieces, and then discards the copies.
+    #[inline]
+    pub fn scan_segments(segments: &[Bytes]) -> Result<Frame, ParseError> {
+        Self::scan_segments_with_options(segments, &ParseOptions::default())
+    }
+
+    /// Find the end of a value in several pieces, with custom options. See
+    /// [`scan_segments`](Self::scan_segments).
+    pub fn scan_segments_with_options(
+        segments: &[Bytes],
+        options: &ParseOptions,
+    ) -> Result<Frame, ParseError> {
+        let mut total_items = 0;
+        let step = if let [one] = segments {
+            scan_at(one, 0, options, 0, &mut total_items)?
+        } else {
+            scan_at(&Segments::new(segments), 0, options, 0, &mut total_items)?
+        };
+        Ok(match step {
+            Step::Done(len) => Frame::Complete(len),
+            Step::Short(needed) => Frame::Incomplete(needed),
+        })
     }
 
     /// Internal parsing function that tracks nesting depth and total items.
@@ -1340,6 +1386,282 @@ fn parse_attribute_at<I: Input>(
         },
         pos,
     ))
+}
+
+// ============================================================================
+// Scanning over an `Input`
+// ============================================================================
+//
+// Each function finds the end of one value starting at `base`, with the
+// parser's checks in the parser's order, without building the value. A value
+// the input does not hold yet is `Step::Short(n)`: at least `n` bytes past
+// the input's end complete it.
+
+/// The bytes in the shortest RESP value (`+\r\n`, or RESP3's `_\r\n`).
+const MIN_VALUE_LEN: usize = 3;
+
+/// What a scan of one value found.
+enum Step {
+    /// The value ends this many bytes after its start.
+    Done(usize),
+    /// At least this many more bytes complete the value.
+    Short(usize),
+}
+
+/// Scan one value starting at `base`.
+fn scan_at<I: Input>(
+    inp: &I,
+    base: usize,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<Step, ParseError> {
+    if base >= inp.len() {
+        return Ok(Step::Short(MIN_VALUE_LEN));
+    }
+
+    match inp.byte(base) {
+        b'+' | b'-' => Ok(match scan_line(inp, base, options)? {
+            Ok(end) => Step::Done(end + 2),
+            Err(short) => Step::Short(short),
+        }),
+        b':' => Ok(match scan_line(inp, base, options)? {
+            Ok(end) => {
+                header_i64(inp, base, end)?;
+                Step::Done(end + 2)
+            }
+            Err(short) => Step::Short(short),
+        }),
+        b'$' => {
+            let len_end = match scan_line(inp, base, options)? {
+                Ok(end) => end,
+                Err(short) => return Ok(Step::Short(short)),
+            };
+            let len = header_i64(inp, base, len_end)?;
+            if len < 0 {
+                return Ok(Step::Done(len_end + 2));
+            }
+            let len = len as usize;
+            if len > options.max_bulk_string_len {
+                return Err(ParseError::Protocol("bulk string too large".to_string()));
+            }
+            scan_body(inp, base, len_end, len)
+        }
+        b'*' => {
+            if depth >= options.max_depth {
+                return Err(ParseError::NestingTooDeep(depth));
+            }
+            let len_end = match scan_line(inp, base, options)? {
+                Ok(end) => end,
+                Err(short) => return Ok(Step::Short(short)),
+            };
+            let len = header_i64(inp, base, len_end)?;
+            if len < 0 {
+                return Ok(Step::Done(len_end + 2));
+            }
+            let len = len as usize;
+            if len > options.max_collection_elements {
+                return Err(ParseError::CollectionTooLarge(len));
+            }
+            *total_items = total_items
+                .checked_add(len)
+                .ok_or(ParseError::CollectionTooLarge(usize::MAX))?;
+            if *total_items > options.max_total_items {
+                return Err(ParseError::CollectionTooLarge(*total_items));
+            }
+            scan_elements(inp, base, len_end + 2, len, options, depth, total_items)
+        }
+        #[cfg(feature = "resp3")]
+        b'_' => scan_fixed(inp, base, 3, parse_null),
+        #[cfg(feature = "resp3")]
+        b'#' => scan_fixed(inp, base, 4, parse_boolean),
+        #[cfg(feature = "resp3")]
+        b',' => Ok(match scan_line(inp, base, options)? {
+            Ok(end) => {
+                inp.with_range(base + 1, base + end, double_value)?;
+                Step::Done(end + 2)
+            }
+            Err(short) => Step::Short(short),
+        }),
+        #[cfg(feature = "resp3")]
+        b'(' => Ok(match scan_line(inp, base, options)? {
+            Ok(end) => Step::Done(end + 2),
+            Err(short) => Step::Short(short),
+        }),
+        #[cfg(feature = "resp3")]
+        b'!' => {
+            let len_end = match scan_line(inp, base, options)? {
+                Ok(end) => end,
+                Err(short) => return Ok(Step::Short(short)),
+            };
+            let len = header_usize(inp, base, len_end)?;
+            if len > options.max_bulk_string_len {
+                return Err(ParseError::Protocol("bulk error too large".to_string()));
+            }
+            scan_body(inp, base, len_end, len)
+        }
+        #[cfg(feature = "resp3")]
+        b'=' => {
+            let len_end = match scan_line(inp, base, options)? {
+                Ok(end) => end,
+                Err(short) => return Ok(Step::Short(short)),
+            };
+            let len = header_usize(inp, base, len_end)?;
+            if len > options.max_bulk_string_len {
+                return Err(ParseError::Protocol(
+                    "verbatim string too large".to_string(),
+                ));
+            }
+            let (data_start, data_end, total_end) = match body_end(inp, base, len_end, len)? {
+                Ok(bounds) => bounds,
+                Err(short) => return Ok(Step::Short(short)),
+            };
+            if len < 4 || inp.byte(base + data_start + 3) != b':' {
+                return Err(ParseError::InvalidVerbatimFormat);
+            }
+            trailing_crlf(inp, base + data_end)?;
+            Ok(Step::Done(total_end))
+        }
+        #[cfg(feature = "resp3")]
+        b'%' => match scan_aggregate(inp, base, options, depth, total_items, 2, 0)? {
+            Ok((len, pos)) => scan_elements(inp, base, pos, 2 * len, options, depth, total_items),
+            Err(short) => Ok(Step::Short(short)),
+        },
+        #[cfg(feature = "resp3")]
+        b'~' | b'>' => match scan_aggregate(inp, base, options, depth, total_items, 1, 0)? {
+            Ok((len, pos)) => scan_elements(inp, base, pos, len, options, depth, total_items),
+            Err(short) => Ok(Step::Short(short)),
+        },
+        #[cfg(feature = "resp3")]
+        b'|' => match scan_aggregate(inp, base, options, depth, total_items, 2, 1)? {
+            Ok((len, pos)) => {
+                scan_elements(inp, base, pos, 2 * len + 1, options, depth, total_items)
+            }
+            Err(short) => Ok(Step::Short(short)),
+        },
+        other => Err(ParseError::InvalidPrefix(other)),
+    }
+}
+
+/// The offset from `base` of the CR that ends the line at `base`, or, when
+/// the input holds no CRLF yet, the bytes still needed: 1 after a final CR,
+/// 2 otherwise.
+#[inline]
+fn scan_line<I: Input>(
+    inp: &I,
+    base: usize,
+    options: &ParseOptions,
+) -> Result<Result<usize, usize>, ParseError> {
+    match inp.find_crlf(base, options.max_line_len)? {
+        Some(cr) => Ok(Ok(cr - base)),
+        None if inp.byte(inp.len() - 1) == b'\r' => Ok(Err(1)),
+        None => Ok(Err(2)),
+    }
+}
+
+/// [`body_bounds`], or the bytes still needed when the input is short.
+#[inline]
+fn body_end<I: Input>(
+    inp: &I,
+    base: usize,
+    len_end: usize,
+    len: usize,
+) -> Result<Result<(usize, usize, usize), usize>, ParseError> {
+    let data_start = len_end + 2;
+    let data_end = data_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let total_end = data_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError::InvalidInteger("length overflow".to_string()))?;
+    let held = inp.len() - base;
+    if held < total_end {
+        return Ok(Err(total_end - held));
+    }
+    Ok(Ok((data_start, data_end, total_end)))
+}
+
+/// Scan a length-prefixed body and its trailing CRLF.
+#[inline]
+fn scan_body<I: Input>(
+    inp: &I,
+    base: usize,
+    len_end: usize,
+    len: usize,
+) -> Result<Step, ParseError> {
+    match body_end(inp, base, len_end, len)? {
+        Ok((_, data_end, total_end)) => {
+            trailing_crlf(inp, base + data_end)?;
+            Ok(Step::Done(total_end))
+        }
+        Err(short) => Ok(Step::Short(short)),
+    }
+}
+
+/// [`aggregate_header`], or the bytes still needed when its line is
+/// incomplete.
+#[cfg(feature = "resp3")]
+#[inline]
+fn scan_aggregate<I: Input>(
+    inp: &I,
+    base: usize,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+    per_element: usize,
+    extra: usize,
+) -> Result<Result<(usize, usize), usize>, ParseError> {
+    if depth >= options.max_depth {
+        return Err(ParseError::NestingTooDeep(depth));
+    }
+    if let Err(short) = scan_line(inp, base, options)? {
+        return Ok(Err(short));
+    }
+    aggregate_header(inp, base, options, depth, total_items, per_element, extra).map(Ok)
+}
+
+/// A parser of one value from a slice that holds it.
+#[cfg(feature = "resp3")]
+type SliceParser = fn(&[u8]) -> Result<(Value, usize), ParseError>;
+
+/// Scan a value of fixed length `len` that `parse` checks.
+#[cfg(feature = "resp3")]
+#[inline]
+fn scan_fixed<I: Input>(
+    inp: &I,
+    base: usize,
+    len: usize,
+    parse: SliceParser,
+) -> Result<Step, ParseError> {
+    let held = inp.len() - base;
+    if held < len {
+        return Ok(Step::Short(len - held));
+    }
+    let (_, consumed) = inp.with_range(base, base + len, parse)?;
+    Ok(Step::Done(consumed))
+}
+
+/// Scan `count` consecutive values starting at offset `pos` from `base`, the
+/// elements of an aggregate at depth `depth`.
+fn scan_elements<I: Input>(
+    inp: &I,
+    base: usize,
+    mut pos: usize,
+    count: usize,
+    options: &ParseOptions,
+    depth: usize,
+    total_items: &mut usize,
+) -> Result<Step, ParseError> {
+    for i in 0..count {
+        match scan_at(inp, base + pos, options, depth + 1, total_items)? {
+            Step::Done(consumed) => pos += consumed,
+            Step::Short(short) => {
+                let rest = (count - i - 1).saturating_mul(MIN_VALUE_LEN);
+                return Ok(Step::Short(short.saturating_add(rest)));
+            }
+        }
+    }
+    Ok(Step::Done(pos))
 }
 
 // ============================================================================

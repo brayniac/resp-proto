@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use resp_proto::{ParseOptions, Value};
+use resp_proto::{Frame, ParseError, ParseOptions, Value};
 use std::time::Instant;
 
 const ITERATIONS: usize = 100_000;
@@ -192,6 +192,49 @@ fn segmented_parse_matches_contiguous() {
             }
         }
         assert!(splits > ITERATIONS * 4);
+    }
+}
+
+/// `scan_segments` agrees with `parse_segments` on any split of an input:
+/// complete with the same length, incomplete, or the same error.
+#[test]
+fn scan_agrees_with_parse() {
+    for options in [
+        ParseOptions::new()
+            .max_bulk_string_len(MAX_INPUT_LEN)
+            .max_collection_elements(4)
+            .max_total_items(8)
+            .max_depth(4),
+        ParseOptions::new().max_line_len(6),
+    ] {
+        let mut state = 0x7363_616e_7365_6773;
+        let mut seen = [0usize; 3];
+        for iteration in 0..ITERATIONS {
+            let (mut owned, _) = input_for(iteration, &mut state);
+            owned.truncate(MAX_INPUT_LEN);
+            let input = owned.as_slice();
+            let mut check = |cuts: &[usize]| {
+                let pieces = split_at(input, cuts);
+                let parsed = Value::parse_segments_with_options(&pieces, &options);
+                let scanned = Value::scan_segments_with_options(&pieces, &options);
+                match (&parsed, &scanned) {
+                    (Ok((_, n)), Ok(Frame::Complete(m))) if n == m => seen[0] += 1,
+                    (Err(ParseError::Incomplete), Ok(Frame::Incomplete(need))) if *need > 0 => {
+                        seen[1] += 1
+                    }
+                    (Err(e), Err(f)) if e == f => seen[2] += 1,
+                    _ => panic!(
+                        "input {input:?} split at {cuts:?}: parse {parsed:?}, scan {scanned:?}"
+                    ),
+                }
+            };
+            for cut in 0..=input.len() {
+                check(&[cut]);
+            }
+            let every: Vec<usize> = (1..input.len()).collect();
+            check(&every);
+        }
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
     }
 }
 
