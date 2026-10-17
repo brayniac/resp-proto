@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what `parse_bytes` gives on the pieces joined: the same value, consumed
   count and error. A string within one piece is a slice of it; a string that
   spans pieces is copied.
+- `Value::for_each_bytes_mut` calls a closure on every `Bytes` in a value and
+  in the values nested in it, RESP3 variants included when the `resp3`
+  feature is on, so a caller can copy or replace each one without matching
+  the variants itself.
 
 ### Changed
 

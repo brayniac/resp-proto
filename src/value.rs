@@ -551,6 +551,52 @@ impl Value {
         }
     }
 
+    /// Calls `f` on every `Bytes` in the value and in the values nested in
+    /// it, in the order they appear on the wire. `f` can replace each one,
+    /// for example with a copy of a slice that keeps a larger buffer alive.
+    pub fn for_each_bytes_mut<F: FnMut(&mut Bytes)>(&mut self, mut f: F) {
+        self.visit_bytes_mut(&mut f);
+    }
+
+    fn visit_bytes_mut<F: FnMut(&mut Bytes)>(&mut self, f: &mut F) {
+        match self {
+            Value::SimpleString(b) | Value::Error(b) | Value::BulkString(b) => f(b),
+            Value::Integer(_) | Value::Null => {}
+            Value::Array(items) => {
+                for item in items {
+                    item.visit_bytes_mut(f);
+                }
+            }
+            #[cfg(feature = "resp3")]
+            Value::Boolean(_) | Value::Double(_) => {}
+            #[cfg(feature = "resp3")]
+            Value::BigNumber(b) | Value::BulkError(b) => f(b),
+            #[cfg(feature = "resp3")]
+            Value::VerbatimString { data, .. } => f(data),
+            #[cfg(feature = "resp3")]
+            Value::Set(items) | Value::Push(items) => {
+                for item in items {
+                    item.visit_bytes_mut(f);
+                }
+            }
+            #[cfg(feature = "resp3")]
+            Value::Map(entries) => {
+                for (key, value) in entries {
+                    key.visit_bytes_mut(f);
+                    value.visit_bytes_mut(f);
+                }
+            }
+            #[cfg(feature = "resp3")]
+            Value::Attribute { attrs, value } => {
+                for (key, attr) in attrs {
+                    key.visit_bytes_mut(f);
+                    attr.visit_bytes_mut(f);
+                }
+                value.visit_bytes_mut(f);
+            }
+        }
+    }
+
     // ========================================================================
     // Parsing
     // ========================================================================
@@ -2967,5 +3013,72 @@ mod tests {
 
         let result = Value::parse_with_options(&data, &strict_options);
         assert!(matches!(result, Err(ParseError::CollectionTooLarge(_))));
+    }
+
+    fn visited(value: &mut Value) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        value.for_each_bytes_mut(|b| seen.push(b.to_vec()));
+        seen
+    }
+
+    #[test]
+    fn for_each_bytes_mut_visits_resp2_strings_in_wire_order() {
+        let mut value = Value::array(vec![
+            Value::simple_string(b"a"),
+            Value::error(b"b"),
+            Value::integer(1),
+            Value::bulk_string(b"c"),
+            Value::null(),
+            Value::array(vec![Value::bulk_string(b"d")]),
+        ]);
+        assert_eq!(
+            visited(&mut value),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+    }
+
+    #[test]
+    fn for_each_bytes_mut_replaces_each_string() {
+        let mut value = Value::array(vec![
+            Value::bulk_string(b"ab"),
+            Value::array(vec![Value::simple_string(b"cd")]),
+        ]);
+        value.for_each_bytes_mut(|b| *b = Bytes::from(b.to_ascii_uppercase()));
+        assert_eq!(
+            value,
+            Value::array(vec![
+                Value::bulk_string(b"AB"),
+                Value::array(vec![Value::simple_string(b"CD")]),
+            ])
+        );
+    }
+
+    #[cfg(feature = "resp3")]
+    #[test]
+    fn for_each_bytes_mut_visits_resp3_strings_in_wire_order() {
+        let mut value = Value::attribute(
+            vec![(Value::simple_string(b"k"), Value::bulk_string(b"v"))],
+            Value::map(vec![
+                (
+                    Value::bulk_string(b"mk"),
+                    Value::set(vec![Value::big_number(b"1"), Value::bulk_error(b"e")]),
+                ),
+                (
+                    Value::push(vec![Value::verbatim_string(*b"txt", b"vs")]),
+                    Value::array(vec![Value::boolean(true), Value::double(1.5)]),
+                ),
+            ]),
+        );
+        assert_eq!(
+            visited(&mut value),
+            [
+                b"k".to_vec(),
+                b"v".to_vec(),
+                b"mk".to_vec(),
+                b"1".to_vec(),
+                b"e".to_vec(),
+                b"vs".to_vec(),
+            ]
+        );
     }
 }
