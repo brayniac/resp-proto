@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error the parse would return. A caller can scan on each arrival and parse
   once, so an incomplete value's strings that span pieces are not copied and
   discarded on every arrival.
+- `Value::for_each_bytes_mut` calls a closure on every `Bytes` in a value and
+  in the values nested in it, RESP3 variants included when the `resp3`
+  feature is on, so a caller can copy or replace each one without matching
+  the variants itself.
 
 ### Changed
 
